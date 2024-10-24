@@ -8,6 +8,7 @@ from pytubefix.cli import on_progress
 from pydub import AudioSegment
 from mutagen.id3 import ID3, ID3NoHeaderError, APIC, TIT2, TPE1, TALB, USLT
 from mutagen.mp4 import MP4, MP4Cover
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 class YouTubeAudioDownloader:
@@ -191,11 +192,25 @@ class YouTubeAudioDownloader:
             self.logger.error(f'Unexpected error downloading thumbnail: {e}', exc_info=True)
             return None
 
-    def search_and_download_song(
-        self,
-        search_query: str,
-        limit: int = 1
-    ) -> None:
+    def download_song(self, song_data):
+        song, index, limit = song_data
+        metadata = {
+            "title": song.get('title', 'Unknown Title'),
+            "artist": song.get('artists', [{'name': 'Unknown Artist'}])[0].get('name', 'Unknown Artist'),
+            "album": song.get('album', {}).get('name', 'Unknown Album'),
+            "lyrics": self._fetch_lyrics(song.get('videoId'))
+        }
+        video_url = f"https://www.youtube.com/watch?v={song.get('videoId')}"
+        
+        if len(song_data) < limit:
+            self.logger.info(f'Downloading [{index}/{len(song_data)}]: {metadata["title"]} by {metadata["artist"]}')
+        else:
+            self.logger.info(f'Downloading [{index}/{limit}]: {metadata["title"]} by {metadata["artist"]}')
+        
+        self.download_audio(video_url, metadata=metadata)
+        return f"{metadata['title']} by {metadata['artist']}"
+
+    def search_and_download_song(self, search_query: str, limit: int = 1) -> None:
         """
         Searches for songs on YouTube Music and downloads the audio for the top results.
 
@@ -204,21 +219,23 @@ class YouTubeAudioDownloader:
             limit (int, optional): Number of top results to download. Defaults to 1.
         """
         try:
-            results = self.ytmusic.search(search_query, filter='songs')
+            results = self.ytmusic.search(search_query, limit=limit, filter='songs')
             if not results:
                 self.logger.warning(f'No results found for query: "{search_query}"')
                 return
 
-            for index, song in enumerate(results[:limit], start=1):
-                metadata = {
-                    "title": song.get('title', 'Unknown Title'),
-                    "artist": song.get('artists', [{'name': 'Unknown Artist'}])[0].get('name', 'Unknown Artist'),
-                    "album": song.get('album', {}).get('name', 'Unknown Album'),
-                    "lyrics": self._fetch_lyrics(song.get('videoId'))
-                }
-                video_url = f"https://www.youtube.com/watch?v={song.get('videoId')}"
-                self.logger.info(f'Downloading [{index}/{limit}]: {metadata["title"]} by {metadata["artist"]}')
-                self.download_audio(video_url, metadata=metadata)
+            # Prepare a list of tasks
+            tasks = [(song, index, limit) for index, song in enumerate(results[:limit], start=1)]
+
+            # Use ThreadPoolExecutor to download songs concurrently
+            with ThreadPoolExecutor() as executor:
+                future_to_song = {executor.submit(self.download_song, task): task for task in tasks}
+                for future in as_completed(future_to_song):
+                    try:
+                        result = future.result()
+                        self.logger.info(f'Finished downloading: {result}')
+                    except Exception as e:
+                        self.logger.error(f'Error downloading a song: {e}', exc_info=True)
 
         except Exception as e:
             self.logger.error(f'Error in search/download process: {e}', exc_info=True)
@@ -252,6 +269,6 @@ class YouTubeAudioDownloader:
 
 if __name__ == "__main__":
     # Example usage
-    downloader = YouTubeAudioDownloader(output_path='downloads', log_level=logging.DEBUG)
-    search_query = "no eyes clapton"
-    downloader.search_and_download_song(search_query)
+    downloader = YouTubeAudioDownloader(output_path='bts', log_level=logging.DEBUG)
+    search_query = "bts"
+    downloader.search_and_download_song(search_query,limit=1000)
