@@ -9,7 +9,9 @@ from pydub import AudioSegment
 from mutagen.id3 import ID3, ID3NoHeaderError, APIC, TIT2, TPE1, TALB, USLT
 from mutagen.mp4 import MP4, MP4Cover
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from requests.exceptions import ConnectionError
+import time
+import re
 
 class YouTubeAudioDownloader:
     """
@@ -53,10 +55,64 @@ class YouTubeAudioDownloader:
             logger.addHandler(handler)
         return logger
 
+    def _get_safe_filename(self, title: str, artist: str) -> str:
+        """
+        Generates a safe filename by removing invalid characters.
+
+        Args:
+            title (str): The title of the song.
+            artist (str): The artist of the song.
+
+        Returns:
+            str: A sanitized filename.
+        """
+        safe_title = re.sub(r'[\\/*?:"<>|]', "", title)
+        safe_artist = re.sub(r'[\\/*?:"<>|]', "", artist)
+        filename = f"{safe_title} - {safe_artist}.mp3"
+        return filename
+
+    def download_song(self, song_data):
+        """
+        Downloads a single song if it's not already present in the output directory.
+
+        Args:
+            song_data (tuple): A tuple containing song information, index, and limit.
+
+        Returns:
+            str: Information about the downloaded song or if it was skipped.
+        """
+        song, index, limit = song_data
+        metadata = {
+            "title": song.get('title', 'Unknown Title'),
+            "artist": song.get('artists', [{'name': 'Unknown Artist'}])[0].get('name', 'Unknown Artist'),
+            "album": song.get('album', {}).get('name', 'Unknown Album'),
+            "lyrics": self._fetch_lyrics(song.get('videoId'))
+        }
+        video_url = f"https://www.youtube.com/watch?v={song.get('videoId')}"
+        
+        # Generate the expected filename
+        expected_filename = self._get_safe_filename(metadata['title'], metadata['artist'])
+        expected_filepath = os.path.join(self.output_path, expected_filename)
+        
+        # Check if the file already exists
+        if os.path.exists(expected_filepath):
+            self.logger.info(f"File already exists, skipping: {expected_filename}")
+            return f"{metadata['title']} by {metadata['artist']} (already exists)"
+        
+        # Proceed with download if the file doesn't exist
+        if index <= limit:
+            self.logger.info(f'Downloading [{index}/{limit}]: {metadata["title"]} by {metadata["artist"]}')
+        else:
+            self.logger.info(f'Downloading [{index}]: {metadata["title"]} by {metadata["artist"]}')
+        
+        downloaded_file = self.download_audio(video_url, metadata=metadata, expected_filename=expected_filename)
+        return f"{metadata['title']} by {metadata['artist']}"
+
     def download_audio(
         self,
         video_url: str,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        expected_filename: Optional[str] = None
     ) -> Optional[str]:
         """
         Downloads audio from a YouTube video URL, converts it to MP3,
@@ -65,6 +121,7 @@ class YouTubeAudioDownloader:
         Args:
             video_url (str): The URL of the YouTube video.
             metadata (Optional[Dict[str, Any]], optional): Metadata to embed. Defaults to None.
+            expected_filename (Optional[str], optional): The desired MP3 filename. Defaults to None.
 
         Returns:
             Optional[str]: Path to the downloaded MP3 file, or None if failed.
@@ -77,11 +134,17 @@ class YouTubeAudioDownloader:
                 self.logger.warning('No audio streams available for this video.')
                 return None
 
-            self.logger.info(f'Downloading audio for: {yt.title}')
-            downloaded_file = audio_stream.download(self.output_path)
+            # Use a temporary filename if expected_filename is provided
+            if expected_filename:
+                temp_filename = expected_filename + ".temp"
+            else:
+                temp_filename = "temp_audio"
+
+            downloaded_file = audio_stream.download(self.output_path, filename=temp_filename)
             self.logger.debug(f'Audio downloaded to: {downloaded_file}')
 
-            mp3_file = self._convert_to_mp3(downloaded_file)
+            # Convert to MP3 using the expected filename
+            mp3_file = self._convert_to_mp3(downloaded_file, expected_filename)
             self.logger.info(f'Converted to MP3: {mp3_file}')
             thumbnail_url = yt.thumbnail_url.replace('/sd','/maxres')
             if metadata:
@@ -94,18 +157,22 @@ class YouTubeAudioDownloader:
             self.logger.error(f'Error downloading audio: {e}', exc_info=True)
             return None
 
-    def _convert_to_mp3(self, file_path: str) -> str:
+    def _convert_to_mp3(self, file_path: str, expected_filename: Optional[str] = None) -> str:
         """
         Converts an audio file to MP3 format.
 
         Args:
             file_path (str): Path to the downloaded audio file.
+            expected_filename (Optional[str], optional): Desired MP3 filename. Defaults to None.
 
         Returns:
             str: Path to the converted MP3 file.
         """
         try:
-            mp3_file_path = os.path.splitext(file_path)[0] + ".mp3"
+            if expected_filename:
+                mp3_file_path = os.path.join(self.output_path, expected_filename)
+            else:
+                mp3_file_path = os.path.splitext(file_path)[0] + ".mp3"
             audio = AudioSegment.from_file(file_path)
             audio.export(mp3_file_path, format="mp3")
             os.remove(file_path)
@@ -192,25 +259,38 @@ class YouTubeAudioDownloader:
             self.logger.error(f'Unexpected error downloading thumbnail: {e}', exc_info=True)
             return None
 
-    def download_song(self, song_data):
-        song, index, limit = song_data
-        metadata = {
-            "title": song.get('title', 'Unknown Title'),
-            "artist": song.get('artists', [{'name': 'Unknown Artist'}])[0].get('name', 'Unknown Artist'),
-            "album": song.get('album', {}).get('name', 'Unknown Album'),
-            "lyrics": self._fetch_lyrics(song.get('videoId'))
-        }
-        video_url = f"https://www.youtube.com/watch?v={song.get('videoId')}"
+    def download_song_with_retries(self, search_query: str, limit: int = 1, max_retries: int = 3) -> None:
+        """
+        Searches a song on YouTube Music and downloads the audio for the top results with retry logic.
         
-        if len(song_data) < limit:
-            self.logger.info(f'Downloading [{index}/{len(song_data)}]: {metadata["title"]} by {metadata["artist"]}')
-        else:
-            self.logger.info(f'Downloading [{index}/{limit}]: {metadata["title"]} by {metadata["artist"]}')
-        
-        self.download_audio(video_url, metadata=metadata)
-        return f"{metadata['title']} by {metadata['artist']}"
+        Args:
+            search_query (str): Search term for YouTube Music.
+            limit (int, optional): Number of top results to download. Defaults to 1.
+            max_retries (int, optional): Number of times to retry on connection error. Defaults to 3.
+        """
+        attempt = 0
+        while attempt < max_retries:
+            try:
+                results = self.ytmusic.search(search_query, limit=limit, filter='songs')
+                if not results:
+                    self.logger.warning(f'No results found for query: "{search_query}"')
+                    return
 
-    def search_and_download_song(self, search_query: str, limit: int = 1) -> None:
+                # Prepare a list of tasks
+                tasks = [(song, index, limit) for index, song in enumerate(results[:limit], start=1)]
+                self.download_song(tasks[0])
+
+                return  # Exit if downloads are successful
+
+            except ConnectionError:
+                attempt += 1
+                self.logger.warning(f'Connection error occurred, attempt {attempt}/{max_retries}. Retrying in 5 seconds...')
+                time.sleep(5)  # Wait before retrying
+            except Exception as e:
+                self.logger.error(f'Error in search/download process: {e}', exc_info=True)
+                return  # Exit on other exceptions
+            
+    def search_and_download_songs(self, search_query: str, limit: int = 1) -> None:
         """
         Searches for songs on YouTube Music and downloads the audio for the top results.
 
@@ -239,7 +319,7 @@ class YouTubeAudioDownloader:
 
         except Exception as e:
             self.logger.error(f'Error in search/download process: {e}', exc_info=True)
-
+            
     def _fetch_lyrics(self, video_id: Optional[str]) -> str:
         """
         Fetches lyrics for a given video ID from YouTube Music.
@@ -266,9 +346,8 @@ class YouTubeAudioDownloader:
             self.logger.debug(f'No lyrics found for video ID: {video_id}')
             return ''
 
-
 if __name__ == "__main__":
     # Example usage
-    downloader = YouTubeAudioDownloader(output_path='bts', log_level=logging.DEBUG)
-    search_query = "bts"
-    downloader.search_and_download_song(search_query,limit=1000)
+    downloader = YouTubeAudioDownloader(output_path='test')
+    search_query = "labios de mezcal von galo"
+    downloader.download_song_with_retries(search_query)  # Adjust limit as needed
